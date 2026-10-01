@@ -6,8 +6,9 @@ A single-file WordPress plugin to export and bulk-update image alt text and titl
 
 **Export tab**
 - Lists all images: thumbnail, file name (from `_wp_attached_file`), alt text, title, attachment ID, upload date.
-- 50 per page, with search (file name, alt text, title) and a "Missing alt text only" filter.
-- **Export to CSV** downloads *all* images as `image-seo-export-YYYY-MM-DD.csv` (UTF-8 with BOM, columns: File Name, Alt Text, Image Title, Attachment ID). Streamed through `admin-post.php` with a nonce check; nothing is saved on the server.
+- **Used On** column: every published page/post/CPT using the image (featured image, post content, Elementor data, galleries), as links; Elementor templates link to their edit screen. Usage data is cached for 1 hour; use **Refresh usage data** to rebuild.
+- 50 per page, with search (file name, alt text, title) and "Missing alt text only" / "Unused images only" filters.
+- **Export to CSV** downloads *all* images as `image-seo-export-YYYY-MM-DD.csv` (UTF-8 with BOM, columns: File Name, Alt Text, Image Title, Used On, Attachment ID). Streamed through `admin-post.php` with a nonce check; nothing is saved on the server.
 
 **Bulk Update tab**
 - Upload a `.csv`/`.txt` file or paste tab-separated rows from Google Sheets/Excel.

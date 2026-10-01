@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Image SEO Manager
- * Description: Export image file names, alt text and titles from the Media Library to CSV, and bulk-update alt text and titles by file name from a CSV or pasted spreadsheet data.
- * Version:     1.0.0
+ * Description: Export image file names, alt text, titles and where each image is used from the Media Library to CSV, and bulk-update alt text and titles by file name from a CSV or pasted spreadsheet data.
+ * Version:     1.1.0
  * Requires at least: 5.0
  * Requires PHP: 7.2
  * License:     GPL-2.0-or-later
@@ -25,6 +25,13 @@ final class ISEOM_Plugin {
 	const BATCH_SIZE = 100;   // Attachments processed per AJAX batch when applying changes.
 	const JOB_TTL    = 7200;  // Seconds a preview/apply job is kept (transient).
 	const CSV_CHUNK  = 1000;  // Rows fetched per DB query while streaming the CSV export.
+	const USAGE_KEY  = 'iseom_usage_index'; // Transient holding the "Used On" index.
+	const USAGE_TTL  = 3600;  // Seconds the usage index is cached (1 hour).
+	const SCAN_CHUNK = 500;   // Posts read per DB query while building the usage index.
+	const META_CHUNK = 100;   // Elementor data rows read per query (each can be large).
+
+	/** Post types never counted as "usage" (internal / non-public objects). */
+	const USAGE_EXCLUDED_TYPES = array( 'revision', 'attachment', 'nav_menu_item', 'customize_changeset', 'oembed_cache', 'user_request', 'wp_global_styles', 'wp_template', 'wp_template_part', 'wp_navigation', 'wp_font_family', 'wp_font_face' );
 
 	/** Recognised image extensions (used when splitting "name.ext"). */
 	const EXTENSIONS = array( 'jpg', 'jpeg', 'jpe', 'jfif', 'png', 'gif', 'webp', 'avif', 'bmp', 'svg', 'tif', 'tiff', 'ico', 'heic', 'heif' );
@@ -34,6 +41,12 @@ final class ISEOM_Plugin {
 
 	/** @var string Hook suffix of our admin page. */
 	private $hook_suffix = '';
+
+	/** @var array Per-request memo of resolved post URLs (post ID => array( label, url )). */
+	private $link_cache = array();
+
+	/** @var array Post IDs already primed into the WP object cache this request. */
+	private $primed = array();
 
 	/**
 	 * Singleton bootstrap.
@@ -49,6 +62,7 @@ final class ISEOM_Plugin {
 		add_action( 'admin_menu', array( $this, 'register_menu' ) );
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_assets' ) );
 		add_action( 'admin_post_iseom_export', array( $this, 'handle_export' ) );
+		add_action( 'admin_post_iseom_refresh_usage', array( $this, 'handle_refresh_usage' ) );
 		add_action( 'admin_post_iseom_log', array( $this, 'handle_log_download' ) );
 		add_action( 'wp_ajax_iseom_apply_batch', array( $this, 'ajax_apply_batch' ) );
 	}
@@ -227,7 +241,7 @@ JS;
 	 *
 	 * @return array{0:string,1:array}
 	 */
-	private function where_sql( $search = '', $missing_only = false ) {
+	private function where_sql( $search = '', $missing_only = false, $used_ids = null ) {
 		global $wpdb;
 		$where = "p.post_type = 'attachment' AND p.post_mime_type LIKE %s";
 		$args  = array( 'image/%' );
@@ -239,6 +253,10 @@ JS;
 		}
 		if ( $missing_only ) {
 			$where .= " AND ( pa.meta_value IS NULL OR TRIM( pa.meta_value ) = '' )";
+		}
+		// "Unused only": pass the IDs that ARE used and exclude them (integers only, so safe to inline).
+		if ( is_array( $used_ids ) && $used_ids ) {
+			$where .= ' AND p.ID NOT IN ( ' . implode( ',', array_map( 'absint', $used_ids ) ) . ' )';
 		}
 		return array( $where, $args );
 	}
@@ -258,14 +276,18 @@ JS;
 		global $wpdb;
 
 		// Read-only filter form: it still carries a nonce, verified whenever filter params are present.
-		if ( isset( $_GET['s'] ) || isset( $_GET['missing'] ) || isset( $_GET['paged'] ) ) {
+		if ( isset( $_GET['s'] ) || isset( $_GET['missing'] ) || isset( $_GET['unused'] ) || isset( $_GET['paged'] ) ) {
 			check_admin_referer( 'iseom_filter' );
 		}
 		$search  = isset( $_GET['s'] ) ? sanitize_text_field( wp_unslash( $_GET['s'] ) ) : '';
 		$missing = ! empty( $_GET['missing'] );
+		$unused  = ! empty( $_GET['unused'] );
 		$paged   = isset( $_GET['paged'] ) ? max( 1, absint( $_GET['paged'] ) ) : 1;
 
-		list( $where, $args ) = $this->where_sql( $search, $missing );
+		// Usage index: built once (a few bulk queries), then cached in a transient for an hour.
+		$usage = $this->get_usage_index();
+
+		list( $where, $args ) = $this->where_sql( $search, $missing, $unused ? array_keys( $usage['usage'] ) : null );
 		$from                 = $this->from_sql();
 
 		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $from/$where are built from constants; values go through prepare().
@@ -284,6 +306,11 @@ JS;
 
 		if ( $rows ) {
 			update_meta_cache( 'post', wp_list_pluck( $rows, 'ID' ) ); // One query for all thumbnails.
+			$this->prime_usage_posts( wp_list_pluck( $rows, 'ID' ), $usage );
+		}
+
+		if ( isset( $_GET['iseom_refreshed'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- display-only notice.
+			echo '<div class="notice notice-success is-dismissible"><p>Usage data refreshed.</p></div>';
 		}
 
 		// --- Toolbar: filter form + export button.
@@ -295,6 +322,7 @@ JS;
 		wp_nonce_field( 'iseom_filter', '_wpnonce', false );
 		echo '<input type="search" name="s" value="' . esc_attr( $search ) . '" placeholder="Search file name, alt text or title"> ';
 		echo '<label><input type="checkbox" name="missing" value="1" ' . checked( $missing, true, false ) . '> Missing alt text only</label> ';
+		echo '<label><input type="checkbox" name="unused" value="1" ' . checked( $unused, true, false ) . '> Unused images only</label> ';
 		echo '<button class="button">Filter</button>';
 		echo '</form>';
 
@@ -304,16 +332,22 @@ JS;
 		echo '<button class="button button-primary">Export to CSV (all images)</button>';
 		echo '</form>';
 
+		echo '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';
+		echo '<input type="hidden" name="action" value="iseom_refresh_usage">';
+		wp_nonce_field( 'iseom_refresh_usage' );
+		echo '<button class="button">Refresh usage data</button>';
+		echo '</form>';
+
 		echo '</div>';
-		echo '<p>' . esc_html( number_format_i18n( $total ) ) . ' image(s) found.</p>';
+		echo '<p>' . esc_html( number_format_i18n( $total ) ) . ' image(s) found. <span class="iseom-muted">Usage data built ' . esc_html( human_time_diff( $usage['built'] ) ) . ' ago (cached for up to 1 hour).</span></p>';
 
 		// --- Table.
 		echo '<table class="widefat striped iseom-table"><thead><tr>';
-		echo '<th style="width:60px">Thumbnail</th><th>File Name</th><th>Alt Text</th><th>Image Title</th><th style="width:70px">ID</th><th style="width:110px">Uploaded</th>';
+		echo '<th style="width:60px">Thumbnail</th><th>File Name</th><th>Alt Text</th><th>Image Title</th><th>Used On</th><th style="width:70px">ID</th><th style="width:110px">Uploaded</th>';
 		echo '</tr></thead><tbody>';
 
 		if ( ! $rows ) {
-			echo '<tr><td colspan="6">No images found.</td></tr>';
+			echo '<tr><td colspan="7">No images found.</td></tr>';
 		}
 		foreach ( $rows as $r ) {
 			$id    = (int) $r->ID;
@@ -323,6 +357,15 @@ JS;
 			echo '<td>' . esc_html( $this->base_name( $r->file ) ) . '</td>';
 			echo '<td>' . ( '' === trim( (string) $r->alt ) ? '<span class="iseom-missing">missing</span>' : esc_html( $r->alt ) ) . '</td>';
 			echo '<td>' . esc_html( $r->post_title ) . '</td>';
+			echo '<td>';
+			$locations = $this->resolve_usage( $id, $usage );
+			if ( ! $locations ) {
+				echo '<span class="iseom-muted">Not used</span>';
+			}
+			foreach ( $locations as $loc ) { // One clickable link per line, opening in a new tab.
+				echo '<a href="' . esc_url( $loc['url'] ) . '" target="_blank" rel="noopener noreferrer">' . esc_html( $loc['label'] ) . '</a><br>';
+			}
+			echo '</td>';
 			echo '<td><a href="' . esc_url( get_edit_post_link( $id ) ) . '">' . esc_html( $id ) . '</a></td>';
 			echo '<td>' . esc_html( mysql2date( get_option( 'date_format' ), $r->post_date ) ) . '</td>';
 			echo '</tr>';
@@ -337,6 +380,7 @@ JS;
 					'tab'      => 'export',
 					's'        => $search,
 					'missing'  => $missing ? 1 : 0,
+					'unused'   => $unused ? 1 : 0,
 					'_wpnonce' => wp_create_nonce( 'iseom_filter' ),
 				),
 				admin_url( 'upload.php' )
@@ -369,6 +413,11 @@ JS;
 
 		global $wpdb;
 		@set_time_limit( 0 ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		wp_raise_memory_limit( 'admin' );
+
+		// Load (or build) the usage index BEFORE sending headers so a slow build can't corrupt the download.
+		$usage = $this->get_usage_index();
+
 		while ( ob_get_level() ) {
 			ob_end_clean(); // Make sure no earlier output corrupts the file.
 		}
@@ -379,7 +428,7 @@ JS;
 
 		$out = fopen( 'php://output', 'w' );
 		fwrite( $out, "\xEF\xBB\xBF" ); // UTF-8 BOM for Excel / Sheets.
-		fputcsv( $out, array( 'File Name', 'Alt Text', 'Image Title', 'Attachment ID' ), ',', '"', '' );
+		fputcsv( $out, array( 'File Name', 'Alt Text', 'Image Title', 'Used On', 'Attachment ID' ), ',', '"', '' );
 
 		list( $where, $args ) = $this->where_sql();
 		$from                 = $this->from_sql();
@@ -395,8 +444,12 @@ JS;
 					array_merge( $args, array( $last_id, self::CSV_CHUNK ) )
 				)
 			);
+			$this->prime_usage_posts( wp_list_pluck( $rows, 'ID' ), $usage );
 			foreach ( $rows as $r ) {
-				fputcsv( $out, array( $this->base_name( $r->file ), (string) $r->alt, $r->post_title, (int) $r->ID ), ',', '"', '' );
+				// "Used On": URLs joined by " | ", or "Not used".
+				$urls    = wp_list_pluck( $this->resolve_usage( (int) $r->ID, $usage ), 'url' );
+				$used_on = $urls ? implode( ' | ', $urls ) : 'Not used';
+				fputcsv( $out, array( $this->base_name( $r->file ), (string) $r->alt, $r->post_title, $used_on, (int) $r->ID ), ',', '"', '' );
 				$last_id = (int) $r->ID;
 			}
 			flush();
@@ -404,6 +457,288 @@ JS;
 
 		fclose( $out );
 		exit;
+	}
+
+	/* ---------------------------------------------------------------------
+	 * "Used On" detection
+	 * ------------------------------------------------------------------ */
+
+	/** admin-post.php handler: clear the cached usage index and rebuild it. */
+	public function handle_refresh_usage() {
+		if ( ! current_user_can( self::CAPABILITY ) ) {
+			wp_die( esc_html__( 'You do not have permission to do this.', 'image-seo-manager' ), 403 );
+		}
+		check_admin_referer( 'iseom_refresh_usage' );
+
+		delete_transient( self::USAGE_KEY );
+		$this->get_usage_index( true );
+
+		wp_safe_redirect( add_query_arg( array( 'page' => self::PAGE_SLUG, 'tab' => 'export', 'iseom_refreshed' => 1 ), admin_url( 'upload.php' ) ) );
+		exit;
+	}
+
+	/**
+	 * Get the usage index from the 1-hour transient, building it if missing.
+	 *
+	 * @param bool $force Rebuild even if cached.
+	 * @return array{built:int,usage:array,posts:array}
+	 */
+	private function get_usage_index( $force = false ) {
+		if ( ! $force ) {
+			$cached = get_transient( self::USAGE_KEY );
+			if ( is_array( $cached ) && isset( $cached['usage'], $cached['posts'], $cached['built'] ) ) {
+				return $cached;
+			}
+		}
+		$index = $this->build_usage_index();
+		set_transient( self::USAGE_KEY, $index, self::USAGE_TTL );
+		return $index;
+	}
+
+	/**
+	 * Build the usage index with a handful of bulk queries (NOT one query per image):
+	 *   1. featured images (_thumbnail_id meta)
+	 *   2. post_content of every published post/page/CPT, scanned in PHP
+	 *   3. Elementor data (_elementor_data meta), scanned in PHP
+	 * Only published content counts; revisions, autosaves, drafts and trash are ignored.
+	 *
+	 * @return array{built:int,usage:array,posts:array} usage: attachment ID => post IDs; posts: post ID => array( title, type ).
+	 */
+	private function build_usage_index() {
+		global $wpdb;
+		@set_time_limit( 0 ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		wp_raise_memory_limit( 'admin' );
+
+		// Library lookup tables (stem => IDs). Reuses the bulk-update matcher's index.
+		$lib   = $this->build_library_index();
+		$alias = array();
+		foreach ( $lib['exact'] as $stem => $ids ) {
+			// A "photo-scaled" library file is usually referenced by the original name "photo".
+			$orig = preg_replace( '/-(?:scaled|rotated|e\d{10,})$/', '', $stem );
+			if ( '' !== $orig && $orig !== $stem ) {
+				foreach ( $ids as $id ) {
+					$alias[ $orig ][] = $id;
+				}
+			}
+		}
+		$ctx = array( 'items' => $lib['items'], 'exact' => $lib['exact'], 'alias' => $alias );
+
+		$types = self::USAGE_EXCLUDED_TYPES;
+		$ph    = implode( ',', array_fill( 0, count( $types ), '%s' ) );
+
+		$usage = array(); // attachment ID => array( post ID => true ).
+		$info  = array(); // post ID => array( title, type ) for every published post.
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared -- placeholders are generated above; values go through prepare().
+
+		// 1) Post content (Classic + Gutenberg), published only, read in chunks to keep memory flat.
+		$last = 0;
+		do {
+			$posts = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT ID, post_title, post_type, post_content FROM {$wpdb->posts}
+					 WHERE post_status = 'publish' AND post_type NOT IN ( $ph ) AND ID > %d ORDER BY ID ASC LIMIT %d",
+					array_merge( $types, array( $last, self::SCAN_CHUNK ) )
+				)
+			);
+			foreach ( $posts as $p ) {
+				$last                = (int) $p->ID;
+				$info[ $last ]       = array( (string) $p->post_title, (string) $p->post_type );
+				foreach ( $this->find_used_attachments( $p->post_content, $ctx ) as $att ) {
+					$usage[ $att ][ $last ] = true;
+				}
+			}
+		} while ( count( $posts ) === self::SCAN_CHUNK );
+
+		// 2) Featured images.
+		$thumbs = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT pm.post_id, pm.meta_value FROM {$wpdb->postmeta} pm
+				 INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+				 WHERE pm.meta_key = '_thumbnail_id' AND p.post_status = 'publish' AND p.post_type NOT IN ( $ph )",
+				$types
+			)
+		);
+		foreach ( $thumbs as $t ) {
+			$att = (int) $t->meta_value;
+			if ( isset( $lib['items'][ $att ] ) ) {
+				$usage[ $att ][ (int) $t->post_id ] = true;
+			}
+		}
+
+		// 3) Elementor data (pages, posts and elementor_library templates). Keyset-paginated: each row can be large.
+		$last_meta = 0;
+		do {
+			$metas = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT pm.meta_id, pm.post_id, pm.meta_value FROM {$wpdb->postmeta} pm
+					 INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+					 WHERE pm.meta_key = '_elementor_data' AND p.post_status = 'publish' AND p.post_type NOT IN ( $ph ) AND pm.meta_id > %d
+					 ORDER BY pm.meta_id ASC LIMIT %d",
+					array_merge( $types, array( $last_meta, self::META_CHUNK ) )
+				)
+			);
+			foreach ( $metas as $m ) {
+				$last_meta = (int) $m->meta_id;
+				foreach ( $this->find_used_attachments( $m->meta_value, $ctx ) as $att ) {
+					$usage[ $att ][ (int) $m->post_id ] = true;
+				}
+			}
+		} while ( count( $metas ) === self::META_CHUNK );
+
+		// phpcs:enable
+
+		// Flatten + de-duplicate; keep post info only for posts that actually use an image.
+		$out   = array();
+		$posts = array();
+		foreach ( $usage as $att => $pids ) {
+			$pids = array_keys( $pids );
+			sort( $pids, SORT_NUMERIC );
+			$out[ $att ] = $pids;
+			foreach ( $pids as $pid ) {
+				if ( isset( $info[ $pid ] ) ) {
+					$posts[ $pid ] = $info[ $pid ];
+				}
+			}
+		}
+
+		return array( 'built' => time(), 'usage' => $out, 'posts' => $posts );
+	}
+
+	/**
+	 * Scan a blob of content (post_content or Elementor JSON) and return the IDs of library images it references.
+	 *
+	 * Detects: class "wp-image-{ID}", block/Elementor attributes "id":{ID} / "id":"{ID}" / "mediaId", "ids":[..] lists,
+	 * [gallery ids="..."] shortcodes, and file names (resized -300x200 / -scaled variants count).
+	 *
+	 * @param string $text Content to scan.
+	 * @param array  $ctx  Library lookup tables: items, exact, alias.
+	 * @return int[] Attachment IDs.
+	 */
+	private function find_used_attachments( $text, array $ctx ) {
+		static $file_regex = null;
+
+		$found = array();
+		if ( ! is_string( $text ) || '' === $text ) {
+			return $found;
+		}
+
+		// --- By attachment ID.
+		$ids = array();
+		if ( preg_match_all( '/wp-image-(\d+)/', $text, $m ) ) {
+			$ids = array_merge( $ids, $m[1] );
+		}
+		// "id":123 and "id":"123". The lookahead skips Elementor's own element IDs ("id":"1234567","elType":...).
+		if ( preg_match_all( '/"(?:id|mediaId)":\s*"?(\d+)(?!\d)(?!"?,"elType")/', $text, $m ) ) {
+			$ids = array_merge( $ids, $m[1] );
+		}
+		if ( preg_match_all( '/"ids":\s*\[([^\]]*)\]/', $text, $m ) ) {
+			foreach ( $m[1] as $list ) {
+				if ( preg_match_all( '/\d+/', $list, $n ) ) {
+					$ids = array_merge( $ids, $n[0] );
+				}
+			}
+		}
+		if ( false !== stripos( $text, '[gallery' ) && preg_match_all( '/\[gallery[^\]]*?\bids=["\']?([\d,\s]+)/i', $text, $m ) ) {
+			foreach ( $m[1] as $list ) {
+				if ( preg_match_all( '/\d+/', $list, $n ) ) {
+					$ids = array_merge( $ids, $n[0] );
+				}
+			}
+		}
+		foreach ( $ids as $v ) {
+			$i = (int) $v;
+			if ( isset( $ctx['items'][ $i ] ) ) { // Only real library images count.
+				$found[ $i ] = true;
+			}
+		}
+
+		// --- By file name.
+		if ( null === $file_regex ) {
+			$file_regex = '~([^\s"\'<>()/\\\\=,;|\[\]{}?&#:]+)\.(?:' . implode( '|', self::EXTENSIONS ) . ')(?![a-z0-9])~i';
+		}
+		if ( false !== strpos( $text, '.' ) && preg_match_all( $file_regex, $text, $m ) ) {
+			foreach ( array_unique( $m[1] ) as $token ) {
+				$stem = $this->lc( rawurldecode( $token ) );
+				// Most specific candidate first: "photo-300x200" -> "photo-300x200", then "photo".
+				foreach ( array_merge( array( $stem ), $this->stem_variants( $stem ) ) as $cand ) {
+					if ( isset( $ctx['exact'][ $cand ] ) ) {
+						foreach ( $ctx['exact'][ $cand ] as $id ) {
+							$found[ $id ] = true;
+						}
+						break;
+					}
+					if ( isset( $ctx['alias'][ $cand ] ) ) {
+						foreach ( $ctx['alias'][ $cand ] as $id ) {
+							$found[ $id ] = true;
+						}
+						break;
+					}
+				}
+			}
+		}
+
+		return array_keys( $found );
+	}
+
+	/**
+	 * Warm the WP post cache for every post used by the given images, in one query per 500 posts,
+	 * so get_permalink() doesn't hit the database once per link.
+	 */
+	private function prime_usage_posts( array $att_ids, array $usage ) {
+		$need = array();
+		foreach ( $att_ids as $att ) {
+			foreach ( $usage['usage'][ (int) $att ] ?? array() as $pid ) {
+				if ( ! isset( $this->primed[ $pid ] ) ) {
+					$need[ $pid ] = true;
+				}
+			}
+		}
+		foreach ( array_chunk( array_keys( $need ), 500 ) as $chunk ) {
+			get_posts(
+				array(
+					'include'                => $chunk,
+					'post_type'              => array_values( get_post_types() ),
+					'post_status'            => 'publish',
+					'numberposts'            => -1,
+					'suppress_filters'       => true,
+					'no_found_rows'          => true,
+					'update_post_term_cache' => false,
+					'update_post_meta_cache' => false,
+				)
+			);
+			foreach ( $chunk as $pid ) {
+				$this->primed[ $pid ] = true;
+			}
+		}
+	}
+
+	/**
+	 * Locations where one image is used.
+	 *
+	 * @return array[] Each: array( 'label' => string, 'url' => string ). Elementor templates link to the edit screen.
+	 */
+	private function resolve_usage( $att_id, array $usage ) {
+		$out = array();
+		foreach ( $usage['usage'][ $att_id ] ?? array() as $pid ) {
+			if ( ! isset( $this->link_cache[ $pid ] ) ) {
+				$info  = $usage['posts'][ $pid ] ?? array( '', '' );
+				$title = '' !== trim( $info[0] ) ? $info[0] : '(no title)';
+				if ( 'elementor_library' === $info[1] ) {
+					$this->link_cache[ $pid ] = array(
+						'label' => 'Elementor Template: ' . $title,
+						'url'   => admin_url( 'post.php?post=' . (int) $pid . '&action=edit' ),
+					);
+				} else {
+					$url                      = get_permalink( $pid );
+					$this->link_cache[ $pid ] = array( 'label' => $title, 'url' => $url ? $url : '' );
+				}
+			}
+			if ( '' !== $this->link_cache[ $pid ]['url'] ) {
+				$out[] = $this->link_cache[ $pid ];
+			}
+		}
+		return $out;
 	}
 
 	/* ---------------------------------------------------------------------
@@ -553,6 +888,7 @@ JS;
 			}
 
 			// First non-blank row = header. Match column names case-insensitively, ignoring spaces/underscores.
+			// Only the three known fields are read, so exported extras such as "Used On" / "Attachment ID" are ignored.
 			if ( null === $map ) {
 				$map     = array( 'file' => null, 'alt' => null, 'title' => null );
 				$aliases = array(
